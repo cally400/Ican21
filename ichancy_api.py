@@ -39,9 +39,9 @@ class IChancyAPI:
 
     def _load_config(self):
         # Agent credentials
-        self.AGENT_USERNAME = os.getenv("AGENT_USERNAME", "tsa_robert@tsa.com")
-        self.AGENT_PASSWORD = os.getenv("AGENT_PASSWORD", "K041@051kkk")
-        self.PARENT_ID = os.getenv("PARENT_ID", "2307909")
+        self.AGENT_USERNAME = os.getenv("AGENT_USERNAME")
+        self.AGENT_PASSWORD = os.getenv("AGENT_PASSWORD")
+        self.PARENT_ID = os.getenv("PARENT_ID")
 
         # IChancy endpoints
         self.ORIGIN = "https://agents.ichancy.com"
@@ -71,19 +71,15 @@ class IChancyAPI:
         self.REDIS_LAST_LOGIN_KEY = "ichancy:last_login"
 
     def _init_redis(self):
-        """
-        Connect to Redis using Railway env vars:
-        REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
-        """
-        redis_host = os.getenv("REDIS_HOST", "localhost")
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
-        redis_password = os.getenv("REDIS_PASSWORD", None)
+        redis_host = os.getenv("REDIS_HOST")
+        redis_port = int(os.getenv("REDIS_PORT"))
+        redis_password = os.getenv("REDIS_PASSWORD")
 
         self.redis = redis.Redis(
             host=redis_host,
             port=redis_port,
             password=redis_password,
-            decode_responses=True,  # store strings not bytes
+            decode_responses=True,
         )
         try:
             self.redis.ping()
@@ -93,9 +89,6 @@ class IChancyAPI:
             raise
 
     def _init_scraper(self):
-        """
-        Initialize cloudscraper and load cookies from Redis if available.
-        """
         self.scraper = cloudscraper.create_scraper(
             browser={
                 "browser": "chrome",
@@ -118,16 +111,12 @@ class IChancyAPI:
             except Exception as e:
                 self.logger.warning(f"⚠️ Failed to load cookies from Redis: {e}")
 
-        # If here: no valid session
         self.is_logged_in = False
 
     # =========================
     # أدوات الجلسة / Redis
     # =========================
     def _is_session_valid(self) -> bool:
-        """
-        Check if session is still valid based on expiry & last login.
-        """
         session_expiry_str = self.redis.get(self.REDIS_SESSION_EXPIRY_KEY)
         last_login_str = self.redis.get(self.REDIS_LAST_LOGIN_KEY)
 
@@ -149,9 +138,6 @@ class IChancyAPI:
         return (now < session_expiry) and (time_since_login < max_session_age)
 
     def _save_session_to_redis(self):
-        """
-        Save cookies & timestamps to Redis.
-        """
         try:
             cookies = dict(self.scraper.cookies)
             cookies_json = json.dumps(cookies)
@@ -169,9 +155,6 @@ class IChancyAPI:
             self.logger.error(f"❌ Failed to save session to Redis: {e}")
 
     def _clear_session_in_redis(self):
-        """
-        Clear session data from Redis.
-        """
         self.redis.delete(self.REDIS_COOKIES_KEY)
         self.redis.delete(self.REDIS_SESSION_EXPIRY_KEY)
         self.redis.delete(self.REDIS_LAST_LOGIN_KEY)
@@ -200,9 +183,6 @@ class IChancyAPI:
     # تسجيل الدخول وإعادة المحاولة
     # =========================
     def login(self) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Login to agent and save session in Redis.
-        """
         if not self.scraper:
             self._init_scraper()
 
@@ -219,7 +199,10 @@ class IChancyAPI:
             )
 
             if self._check_captcha(resp.text):
-                self.logger.warning("❌ Captcha detected during login")
+                self.logger.warning("❌ Captcha detected during login — retrying with new scraper")
+                self._clear_session_in_redis()
+                self.scraper = None
+                self._init_scraper()
                 return False, {"error": "captcha_detected"}
 
             try:
@@ -229,7 +212,6 @@ class IChancyAPI:
                 return False, {"error": "invalid_json"}
 
             if data.get("result", False):
-                # Save session in Redis
                 self._save_session_to_redis()
                 self.is_logged_in = True
                 self.logger.info("✅ Login successful")
@@ -246,9 +228,6 @@ class IChancyAPI:
             return False, {"error": str(e)}
 
     def ensure_login(self) -> bool:
-        """
-        Ensure we have a valid session.
-        """
         if not self.scraper:
             self._init_scraper()
 
@@ -257,24 +236,26 @@ class IChancyAPI:
 
         self.logger.info("🔄 Session invalid or missing, logging in...")
         success, data = self.login()
+
         if not success:
-            error_msg = data.get(
-                "error", data.get("notification", [{}])[0].get("content", "Login failed")
-            )
-            raise RuntimeError(f"❌ Failed to login: {error_msg}")
+            error_msg = data.get("error", "")
+
+            if error_msg == "captcha_detected":
+                self.logger.warning("⚠️ Captcha detected — resetting session and retrying...")
+                self._clear_session_in_redis()
+                self.scraper = None
+                self._init_scraper()
+                success, data = self.login()
+
+            if not success:
+                raise RuntimeError(f"❌ Failed to login: {error_msg}")
+
         return True
 
     @staticmethod
     def with_retry(func):
-        """
-        Decorator to:
-        - ensure login
-        - retry once on failure / captcha / 403
-        """
-
         @wraps(func)
         def wrapper(self: "IChancyAPI", *args, **kwargs):
-            # First attempt
             self.ensure_login()
             result = func(self, *args, **kwargs)
 
@@ -284,15 +265,13 @@ class IChancyAPI:
                 self.ensure_login()
                 return func(self, *args, **kwargs)
 
-            # Expect first element to be HTTP status
-            status = result[0] if isinstance(result, tuple) and len(result) > 0 else 0
+            status = result[0] if isinstance(result, tuple) else 0
             data = result[1] if isinstance(result, tuple) and len(result) > 1 else {}
 
-            # Detect failure (non-200, result=False, captcha)
             data_str = str(data).lower()
             captcha_like = "captcha" in data_str or "cloudflare" in data_str
 
-            if status != 200 or (isinstance(data, dict) and not data.get("result", True)) or captcha_like:
+            if status != 200 or captcha_like:
                 self.logger.warning(
                     f"⚠️ {func.__name__} failed (status={status}), retrying with new login..."
                 )
@@ -322,10 +301,6 @@ class IChancyAPI:
     # =========================
     @with_retry
     def create_player(self) -> Tuple[int, Dict[str, Any], str, str, Optional[str]]:
-        """
-        Create random player.
-        Returns: (status_code, data, login, password, player_id)
-        """
         login, pwd = self._generate_random_credentials()
         email = f"{login}@example.com"
 
@@ -420,9 +395,6 @@ class IChancyAPI:
 
     @with_retry
     def get_player_balance(self, player_id: str) -> Tuple[int, Dict, float]:
-        """
-        Returns: (status_code, full_json, balance: float)
-        """
         payload = {"playerId": str(player_id)}
 
         resp = self.scraper.post(
@@ -446,12 +418,8 @@ class IChancyAPI:
     def create_player_with_credentials(
         self, login: str, pwd: str
     ) -> Tuple[int, Dict[str, Any], Optional[str], str]:
-        """
-        Returns: (status_code, data, player_id, email)
-        """
         email = f"{login}@TSA.com"
 
-        # Ensure email is unique
         while self.check_email_exists(email):
             random_suffix = random.randint(1000, 9999)
             email = f"{login}_{random_suffix}@TSA.com"

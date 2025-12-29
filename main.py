@@ -5,6 +5,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request
 import os
 import db
+import threading
+import time
 
 # =========================
 # تهيئة API
@@ -83,6 +85,7 @@ def send_welcome(message):
     user_id = message.from_user.id
     user = db.get_user(user_id)
     referral_id = None
+
     if len(message.text.split()) > 1:
         try:
             referral_id = int(message.text.split()[1])
@@ -141,7 +144,8 @@ def show_terms(message, user_id, referral_id=None):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("check_join"))
 def handle_check_join(call):
     referral_id = call.data.split(":")[1]
-    referral_id = int(referral_id) if referral_id.isdigit() else None
+    referral_id = int(referral_id) if referral_id and referral_id.isdigit() else None
+
     if check_channel_membership(CHANNEL_ID, call.from_user.id):
         db.mark_channel_joined(call.from_user.id)
         show_terms(call.message, call.from_user.id, referral_id)
@@ -157,11 +161,13 @@ def handle_accept_terms(call):
     parts = call.data.split(":")
     user_id = int(parts[1])
     referral_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+
     if call.from_user.id != user_id:
         return
 
     user = db.get_user(user_id)
     is_new_user = False
+
     if not user:
         db.create_user(
             telegram_id=user_id,
@@ -170,11 +176,13 @@ def handle_accept_terms(call):
             last_name=call.from_user.last_name
         )
         is_new_user = True
+
         if referral_id and referral_id != user_id:
             db.add_referral(referral_id, user_id)
 
     db.accept_terms(user_id)
     bot.edit_message_text("✅ تم قبول الشروط", call.message.chat.id, call.message.message_id)
+
     if is_new_user:
         show_main_menu(call.message)
 
@@ -191,16 +199,20 @@ def handle_reject_terms(call):
 @bot.callback_query_handler(func=lambda c: c.data == "ichancy")
 def handle_ichancy(call):
     user = db.get_user(call.from_user.id)
+
     if not user:
         bot.answer_callback_query(call.id, "❌ المستخدم غير موجود")
         return
+
     has_account = all([
         user.get("player_id"),
         user.get("player_email"),
         user.get("player_username"),
         user.get("player_password")
     ])
+
     keyboard = InlineKeyboardMarkup(row_width=1)
+
     if has_account:
         keyboard.add(
             InlineKeyboardButton("💰 تعبئة رصيد في الموقع", callback_data="ichancy_deposit"),
@@ -212,7 +224,9 @@ def handle_ichancy(call):
             InlineKeyboardButton("➕ إنشاء حساب iChancy", callback_data="ichancy_create")
         )
         text = "🎮 **I Chancy**\n\n❌ لا يوجد لديك حساب في الموقع\n\nاضغط على إنشاء حساب للمتابعة:"
+
     keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_main"))
+
     bot.edit_message_text(
         text=text,
         chat_id=call.message.chat.id,
@@ -220,6 +234,7 @@ def handle_ichancy(call):
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
+
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_main")
@@ -243,7 +258,7 @@ def handle_ichancy_create(call):
 # =========================
 # إعدادات الـ Webhook / Flask
 # =========================
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثال: https://your-app.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", 8080))
 
@@ -267,13 +282,21 @@ def webhook():
         return "OK", 200
     return "Unsupported Media Type", 415
 
-@app.before_first_request
-def set_webhook():
+# =========================
+# Webhook setup (Flask 3.0 compatible)
+# =========================
+def set_webhook_async():
+    time.sleep(1)
     bot.remove_webhook()
     full_url = WEBHOOK_URL + WEBHOOK_PATH
     bot.set_webhook(url=full_url)
     print("Webhook set:", full_url)
 
+threading.Thread(target=set_webhook_async).start()
+
+# =========================
+# Run Flask App
+# =========================
 if __name__ == "__main__":
     print("Bot is running with webhook on port", PORT)
     app.run(host="0.0.0.0", port=PORT)

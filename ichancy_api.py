@@ -498,6 +498,7 @@ class IChancyAPI:
             pass
         return False
 
+    @with_retry
     def check_player_exists(self, login: str) -> bool:
         payload = {"page": 1, "pageSize": 100, "filter": {"login": login}}
 
